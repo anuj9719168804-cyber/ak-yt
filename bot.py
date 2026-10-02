@@ -61,12 +61,12 @@ logger = logging.getLogger("ytbot")
 # ---------------------------------------------------------------------
 # Config (everything comes from env — nothing secret is hardcoded)
 # ---------------------------------------------------------------------
-API_ID = int(os.getenv("API_ID", "0") or 0)
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+API_ID = int(os.getenv("API_ID", "20432885") or 0)
+API_HASH = os.getenv("API_HASH", "4fdcfab1c7f5e24ae69f3ce6bb234dec")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8609525656:AAHYKR952QdEUriHFzfei9gKoX79AoqtMLQ")
+OWNER_ID = int(os.getenv("OWNER_ID", "8729304171") or 0)
 # Admin panel owner (ported from dl.py). Falls back to OWNER_ID.
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0) or OWNER_ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8729304171") or 0) or OWNER_ID
 
 # Direct image URL OR a Telegram post link (https://t.me/channel/123)
 START_PHOTO_URL = os.getenv("START_PHOTO_URL", "https://t.me/log_ak_bot/163")
@@ -112,7 +112,7 @@ SEARCH_MAX = int(os.getenv("SEARCH_MAX", "100") or 100)
 # Extra admins besides ADMIN_ID / OWNER_ID: comma-separated Telegram IDs. Admins are
 # always treated as Lifetime Premium.
 ADMIN_IDS = {
-    i for i in ({ADMIN_ID, OWNER_ID} | {int(x) for x in re.findall(r"\d+", os.getenv("ADMINS", ""))}) if i
+    i for i in ({ADMIN_ID, OWNER_ID} | {int(x) for x in re.findall(r"\d+", os.getenv("ADMINS", "8729304171"))}) if i
 }
 # Free users: downloads per UTC day (0 = unlimited). Premium is never limited.
 DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", "5") or 0)
@@ -120,7 +120,7 @@ DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", "5") or 0)
 PLAYLIST_FREE_MAX = int(os.getenv("PLAYLIST_FREE_MAX", "3") or 0)
 # Plans shown by /plans, as "price:days" pairs; days = lifetime for a forever plan.
 PLANS_RAW = os.getenv("PLANS", "19:12,29:21,45:35,99:99,999:lifetime")
-UPI_ID = os.getenv("UPI_ID", "").strip()
+UPI_ID = os.getenv("UPI_ID", "971916880@ybl").strip()
 # Optional images (URL or Telegram post link) shown with /plans and the referral prompt
 PLANS_PHOTO_URL = os.getenv("PLANS_PHOTO_URL", "https://t.me/log_ak_bot/164").strip()
 REFERRAL_PHOTO_URL = os.getenv("REFERRAL_PHOTO_URL", "https://t.me/log_ak_bot/162").strip()
