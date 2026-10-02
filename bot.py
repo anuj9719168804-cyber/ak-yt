@@ -86,7 +86,7 @@ def _parse_chat_ref(raw: str):
 
 # ---- LOG CHANNEL: yahan apna log channel ID / @username daalo (bot ko us channel mein admin banao) ----
 # Example: "-1001234567890" ya "@mylogchannel"
-LOG_CHANNEL = _parse_chat_ref(os.getenv("LOG_CHANNEL", ""))
+LOG_CHANNEL = _parse_chat_ref(os.getenv("LOG_CHANNEL", "-1003951808679"))
 # ---- FORCE SUBSCRIBE: comma-separated @username / t.me links (bot ko un channels mein admin banao) ----
 # Example: "@channel1,@channel2,-1001234567890"   (@username, t.me link ya -100… ID; /admin se bhi add/remove hota hai)
 FORCE_SUB_RAW = os.getenv("FORCE_SUB", "-1003951808679")
