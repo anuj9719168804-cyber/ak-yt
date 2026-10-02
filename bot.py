@@ -69,7 +69,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0) or OWNER_ID
 
 # Direct image URL OR a Telegram post link (https://t.me/channel/123)
-START_PHOTO_URL = os.getenv("START_PHOTO_URL", "https://t.me/log_ak_bot/158")
+START_PHOTO_URL = os.getenv("START_PHOTO_URL", "https://t.me/log_ak_bot/163")
 POWERED_BY = os.getenv("POWERED_BY", "Anuj Kumar")
 POWERED_BY_URL = os.getenv("POWERED_BY_URL", "https://t.me/anujedits97")
 
@@ -123,7 +123,7 @@ PLANS_RAW = os.getenv("PLANS", "19:12,29:21,45:35,99:99,999:lifetime")
 UPI_ID = os.getenv("UPI_ID", "").strip()
 # Optional images (URL or Telegram post link) shown with /plans and the referral prompt
 PLANS_PHOTO_URL = os.getenv("PLANS_PHOTO_URL", "").strip()
-REFERRAL_PHOTO_URL = os.getenv("REFERRAL_PHOTO_URL", "").strip()
+REFERRAL_PHOTO_URL = os.getenv("REFERRAL_PHOTO_URL", "https://t.me/log_ak_bot/162").strip()
 # (referrals needed, premium days granted when that count is first reached). Rewards stack.
 REFERRAL_REWARDS = [(5, 1), (10, 1)]
 REFERRAL_GOAL = REFERRAL_REWARDS[-1][0]
