@@ -91,7 +91,7 @@ def _parse_chat_ref(raw: str):
 # Private invite link se Telegram bot ko channel ki ID nahi milti, isliye bot khud ID seekhta hai:
 # (1) bot ko us channel mein admin banao -> link match hone par apne aap set, nahi to admins ko "Set karo" button aata hai
 # (2) ya channel mein `/setlog` post karo (bot admin ho). ID DB mein save hoti hai, restart par yaad rehti hai.
-_LOG_CHANNEL_RAW = (os.getenv("LOG_CHANNEL") or os.getenv("LOG_CHANNEL_ID") or "-1004401290975").strip()
+_LOG_CHANNEL_RAW = (os.getenv("LOG_CHANNEL") or os.getenv("LOG_CHANNEL_ID") or "-1004396123873").strip()
 LOG_CHANNEL = _parse_chat_ref(_LOG_CHANNEL_RAW)
 _inv = re.search(r"(?:(?:t|telegram)\.me/(?:\+|joinchat/)|^\+)([\w-]{8,})/?$", _LOG_CHANNEL_RAW)
 LOG_INVITE_HASH = _inv.group(1) if (_inv and LOG_CHANNEL is None) else None  # set only while an invite link is pending
@@ -101,7 +101,7 @@ if LOG_CHANNEL is None and not LOG_INVITE_HASH:
     )
 # ---- FORCE SUBSCRIBE: comma-separated @username / t.me links (bot ko un channels mein admin banao) ----
 # Example: "@channel1,@channel2,-1001234567890"   (@username, t.me link ya -100… ID; /admin se bhi add/remove hota hai)
-FORCE_SUB_RAW = os.getenv("FORCE_SUB", "-1004396123873")
+FORCE_SUB_RAW = os.getenv("FORCE_SUB", "-1003873749415")
 # Force-subscribe screen ki photo (direct URL ya Telegram post link)
 FORCE_SUB_PHOTO_URL = os.getenv("FORCE_SUB_PHOTO_URL", "https://t.me/log_ak_bot/165").strip()
 
