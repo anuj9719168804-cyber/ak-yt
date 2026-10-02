@@ -122,7 +122,7 @@ PLAYLIST_FREE_MAX = int(os.getenv("PLAYLIST_FREE_MAX", "3") or 0)
 PLANS_RAW = os.getenv("PLANS", "19:12,29:21,45:35,99:99,999:lifetime")
 UPI_ID = os.getenv("UPI_ID", "").strip()
 # Optional images (URL or Telegram post link) shown with /plans and the referral prompt
-PLANS_PHOTO_URL = os.getenv("PLANS_PHOTO_URL", "").strip()
+PLANS_PHOTO_URL = os.getenv("PLANS_PHOTO_URL", "https://t.me/log_ak_bot/164").strip()
 REFERRAL_PHOTO_URL = os.getenv("REFERRAL_PHOTO_URL", "https://t.me/log_ak_bot/162").strip()
 # (referrals needed, premium days granted when that count is first reached). Rewards stack.
 REFERRAL_REWARDS = [(5, 1), (10, 1)]
