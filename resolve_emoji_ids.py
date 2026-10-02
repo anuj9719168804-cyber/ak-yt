@@ -1,0 +1,79 @@
+"""
+Custom emoji ID -> normal emoji resolver.
+
+Run from the yt_downloader_bot folder (needs API_ID / API_HASH / BOT_TOKEN in .env):
+    python resolve_emoji_ids.py                     # the built-in list below
+    python resolve_emoji_ids.py <id> <id> ...       # only the IDs you pass
+
+Prints every ID with the emoji it belongs to, then a grouped list by emoji.
+Writes the same result to emoji_ids_resolved.txt.
+"""
+import asyncio
+import os
+from collections import defaultdict
+
+from dotenv import load_dotenv
+from pyrogram import Client
+
+load_dotenv()
+
+IDS = """
+6235355429237430006 6147815573314082674 5350427505805238170 5287267357427776826 5222447122586036397
+5224180824789770658 5224663892646452625 5224205542326557875 5221953158397321906 5309981979167463973
+5309928798882395910 5246765089977037900 5285161474833006232 5285078504654783223 5426918974971486256
+5474143948572223102 5472057595193743789 5472159355853888315 6307665627481903641 6088957586302831521
+6109328624777694916 6109693533789096849 6109213820301872263 6109557847182281178 6109447084270684884
+6109281659310312426 6111423933162981989 6109211870386720327 6109655025112320594 6123114099703287427
+6122990988760715630 6123066743393881068 6120791828066208322 6221756527691173256 6168137610507062619
+6192627406654671561 6190651597144461028 6192895915125116350 6192532968913767492 6217491333108470219
+5463071033256848094 6235403472741603087 6147565374289220368 6147464060305676048 6147524086768604985
+5449449325434266744 6273840152980755328 6276057176444246654 6273997026661241933 6273726078649372769
+6274007313107915274 5978776771623914876 5978686323907628843 5852873584912896283 5895297528106061174
+5895735846698487922 5895343514320899727 5913754823643107921 5197434882321567830 5463256910851546817
+5463423955014529788 5465443379917629504 5465465194056525619 6235620067942341623 6235717714023814969
+6235593671073339928 6147617184479711380 5346181118884331907 5971944878815317190 6132184924603554220
+6237519835056575931 6086702706997597042 6089117655438990048 6129711392808247546 6129732880529628243
+6120464813551260125 6120726896750629340 5312361253610475399 6104631352190043951 6123129707614441341
+6237825705447527988
+""".split()
+
+
+async def main():
+    import sys
+    # python resolve_emoji_ids.py 5258077307985207053 5275969776668134187  -> only those IDs
+    raw = sys.argv[1:] or IDS
+    ids = list(dict.fromkeys(int(i) for i in raw))  # de-duplicated, order kept
+    app = Client(
+        "resolver",
+        api_id=int(os.environ["API_ID"]),
+        api_hash=os.environ["API_HASH"],
+        bot_token=os.environ["BOT_TOKEN"],
+        in_memory=True,
+    )
+    found = {}
+    async with app:
+        for n in range(0, len(ids), 100):
+            chunk = ids[n:n + 100]
+            stickers = await app.get_custom_emoji_stickers(chunk)
+            for s in stickers:
+                found[int(s.custom_emoji_id)] = s.emoji or "?"
+
+    lines = []
+    for i in ids:
+        lines.append(f"{i}  {found.get(i, '(not found)')}")
+    grouped = defaultdict(list)
+    for i in ids:
+        grouped[found.get(i, "(not found)")].append(i)
+    lines.append("")
+    lines.append("--- grouped by emoji ---")
+    for emo, group in grouped.items():
+        lines.append(f"{emo}  ->  " + ", ".join(str(g) for g in group))
+
+    out = "\n".join(lines)
+    print(out)
+    with open("emoji_ids_resolved.txt", "w", encoding="utf-8") as f:
+        f.write(out)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

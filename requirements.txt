@@ -1,0 +1,7 @@
+kurigram>=2.2.26
+tgcrypto==1.2.5
+python-dotenv==1.0.0
+yt-dlp[default]
+curl_cffi>=0.10,<0.14
+# PO-token plugin for yt-dlp (talks to the local server started by entrypoint.sh / pot_provider.py)
+bgutil-ytdlp-pot-provider
