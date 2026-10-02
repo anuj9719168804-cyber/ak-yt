@@ -3,7 +3,7 @@
 # loopback only, waits for it, then hands over to the bot. If it doesn't come
 # up the bot still runs — YouTube just uses the cookie-free client sets.
 if [ -f /opt/bgutil-pot/server/build/main.js ]; then
-    node /opt/bgutil-pot/server/build/main.js --host 127.0.0.1 > /tmp/bgutil-pot.log 2>&1 &
+    node /opt/bgutil-pot/server/build/main.js --port 4416 > /tmp/bgutil-pot.log 2>&1 &
     BGUTIL_PID=$!
     UP=0
     for i in $(seq 1 30); do
