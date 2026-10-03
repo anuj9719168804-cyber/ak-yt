@@ -6,3 +6,4 @@ curl_cffi>=0.10,<0.14
 # PO-token plugin for yt-dlp (talks to the local server started by entrypoint.sh / pot_provider.py)
 bgutil-ytdlp-pot-provider==1.3.1
 pymongo[srv]>=4.6
+deep-translator>=1.11.4
