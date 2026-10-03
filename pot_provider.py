@@ -41,6 +41,7 @@ DOCKER_MAIN_JS = "/opt/bgutil-pot/server/build/main.js"
 LOCAL_SERVER_DIR = os.path.join(POT_HOME, "server")
 LOCAL_MAIN_JS = os.path.join(LOCAL_SERVER_DIR, "build", "main.js")
 POT_LOG = os.path.join(tempfile.gettempdir(), "bgutil-pot-bot.log")
+LOOPBACK_PRELOAD = os.path.join(_HERE, "force_loopback.cjs")
 
 _ready = threading.Event()
 _server_process = None
@@ -94,11 +95,15 @@ def _start_server(main_js: str, cwd: str) -> bool:
     global _server_process
     _set_status(f"starting provider HTTP server on 127.0.0.1:{POT_PORT}...")
     try:
-        # --host 127.0.0.1: loopback only, so hosts like Render don't mistake it
-        # for the web service's public port.
+        # The 1.3.1 server has no --host flag, so force_loopback.cjs (preloaded with
+        # --require) pins its listener to 127.0.0.1 — hosts like Render then can't
+        # mistake it for the web service's public port. Missing file = plain start.
         _logf = open(POT_LOG, "wb")
+        cmd = ["node"]
+        if os.path.isfile(LOOPBACK_PRELOAD):
+            cmd += ["--require", LOOPBACK_PRELOAD]
         _server_process = subprocess.Popen(
-            ["node", main_js, "--port", str(POT_PORT)], cwd=cwd,
+            cmd + [main_js, "--port", str(POT_PORT)], cwd=cwd,
             stdout=_logf, stderr=subprocess.STDOUT,
         )
     except Exception as e:
