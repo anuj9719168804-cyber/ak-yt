@@ -70,7 +70,7 @@ logger = logging.getLogger("ytbot")
 # ---------------------------------------------------------------------
 API_ID = int(os.getenv("API_ID", "20432885") or 0)
 API_HASH = os.getenv("API_HASH", "4fdcfab1c7f5e24ae69f3ce6bb234dec").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8609525656:AAHYKR952QdEUriHFzfei9gKoX79AoqtMLQ").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8609525656:AAHGHB7PfRE_2kWmeEUDGvm_S1CSvmRcK3U").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8729304171") or 0)
 # Admin panel owner (ported from dl.py). Falls back to OWNER_ID.
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8729304171") or 0) or OWNER_ID
