@@ -44,21 +44,25 @@ class MongoStore:
         return data
 
     def save(self, data: dict) -> None:
-        ops = []
+        # A hash is remembered only AFTER the write succeeded; otherwise a failed write would be treated as
+        # saved and that change (e.g. a user's "new_logged" flag) would silently be lost on the next restart.
+        ops, pend = [], {}
         for uid, u in data.get("users", {}).items():
             h = self._h(u)
             if self._hashes.get("u:" + uid) != h:
                 ops.append(ReplaceOne({"_id": uid}, {"_id": uid, **u}, upsert=True))
-                self._hashes["u:" + uid] = h
+                pend["u:" + uid] = h
         if ops:
             self.users.bulk_write(ops, ordered=False)
-        mops = []
+            self._hashes.update(pend)
+        mops, mpend = [], {}
         for key, val in data.items():
             if key == "users":
                 continue
             h = self._h(val)
             if self._hashes.get("m:" + key) != h:
                 mops.append(ReplaceOne({"_id": key}, {"_id": key, "value": val}, upsert=True))
-                self._hashes["m:" + key] = h
+                mpend["m:" + key] = h
         if mops:
             self.meta.bulk_write(mops, ordered=False)
+            self._hashes.update(mpend)
