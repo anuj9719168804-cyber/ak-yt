@@ -1,0 +1,776 @@
+--- a/bot.py	2026-10-04 01:47:03.006631784 +0000
++++ b/bot.py	2026-10-04 02:09:36.739964946 +0000
+@@ -646,6 +646,7 @@
+         u["total_downloads"] = u.get("total_downloads", 0) + 1
+     DB["total_downloads"] = DB.get("total_downloads", 0) + 1
+     bump_stat("downloads")
++    bump_stat_map("dl_users", str(user_id))
+     save_data()
+ 
+ 
+@@ -747,6 +748,458 @@
+     )
+ 
+ 
++def bump_stat_map(key: str, sub: str, n: int = 1):
++    """Per-day nested counter, e.g. day['fail_reasons']['private'] / day['dl_users']['<uid>']."""
++    ds = DB.setdefault("daily_stats", {})
++    day = ds.setdefault(_ist_date(), {})
++    mp = day.setdefault(key, {})
++    mp[sub] = mp.get(sub, 0) + n
++    for old_day in sorted(ds)[:-7]:  # per-user maps are big: keep them 7 days, totals stay 14
++        for hk in ("dl_users", "req_users", "fail_users", "limit_users"):
++            ds[old_day].pop(hk, None)
++    save_data(force=False)
++
++
++# ---- alerts / abuse / top videos config (all optional, env) -----------------------------------
++SPIKE_WINDOW_MIN = int(os.getenv("SPIKE_WINDOW_MIN", "30") or 30)        # look-back window for the failure-rate alert
++SPIKE_RATE = float(os.getenv("SPIKE_RATE", "0.4") or 0)                  # alert when failures/total >= this (0 = alerts off)
++SPIKE_MIN_EVENTS = int(os.getenv("SPIKE_MIN_EVENTS", "10") or 10)        # ...and at least this many downloads in the window
++SPIKE_COOLDOWN_MIN = int(os.getenv("SPIKE_COOLDOWN_MIN", "60") or 60)    # min minutes between two spike alerts
++ABUSE_REQS = int(os.getenv("ABUSE_REQS", "100") or 0)                    # requests (links/searches) per user per day (0 = off)
++ABUSE_FAILS = int(os.getenv("ABUSE_FAILS", "10") or 0)                   # failed downloads per user per day (0 = off)
++TOP_VIDEOS_MAX = 300
++
++_EVENTS = deque(maxlen=3000)   # (timestamp, ok, reason) of recent download results, for the spike alert
++_LAST_SPIKE = [0.0]
++_ABUSE_ALERTED: set = set()    # (ist_date, uid) already reported to admins
++
++SPIKE_HINTS = {
++    "rate_limit": "YouTube ne server IP rate-limit kiya hai — thodi der ruko, /authcheck se cookies dekho.",
++    "bot_check": "Cookies expire/blocked lag rahi hain — /authcheck chalao, phir /cookies se nayi upload karo.",
++    "forbidden": "yt-dlp purana ho sakta hai — /ytdlpupdate chalao aur /potstatus dekho.",
++    "network": "Server ka internet/proxy check karo.",
++    "ffmpeg": "ffmpeg ya disk space check karo.",
++    "upload": "Telegram upload/flood errors — limits check karo.",
++    "timeout": "Server slow/overloaded hai — MAX_CONCURRENT_DOWNLOADS aur network dekho.",
++}
++
++
++def record_request(uid: int):
++    """A user sent a link / search (counted per day for abuse detection)."""
++    bump_stat_map("req_users", str(uid))
++    _check_abuse(uid)
++
++
++def record_failure(uid: int, reason: str):
++    """One failed download: daily totals, per-reason, per-user, spike window, abuse check."""
++    bump_stat("failures")
++    bump_stat_map("fail_reasons", reason)
++    bump_stat_map("fail_users", str(uid))
++    _EVENTS.append((time.time(), False, reason))
++    _check_abuse(uid)
++
++
++def record_download(uid: int, url: str, title, size, cache_hit: bool):
++    """One delivered file: cache hit/miss, bytes served from cache, top videos, spike window."""
++    _EVENTS.append((time.time(), True, ""))
++    bump_stat("cache_hits" if cache_hit else "cache_miss")
++    if cache_hit and size:
++        bump_stat("cache_bytes", int(size))
++    try:
++        vid = yt_video_id(url)
++    except Exception:
++        vid = None
++    if vid:
++        tv = DB.setdefault("top_videos", {})
++        e = tv.setdefault(vid, {"t": str(title or "")[:80], "n": 0})
++        e["n"] = e.get("n", 0) + 1
++        e["last"] = _ist_date()
++        if title and not e.get("t"):
++            e["t"] = str(title)[:80]
++        if len(tv) > TOP_VIDEOS_MAX + 100:  # keep the list small (mutate in place)
++            for k, _v in sorted(tv.items(), key=lambda x: x[1].get("n", 0))[: len(tv) - TOP_VIDEOS_MAX]:
++                tv.pop(k, None)
++
++
++def _check_abuse(uid: int):
++    """Tell the admins once per day per user when someone crosses the request / failure limit."""
++    if not (ABUSE_REQS or ABUSE_FAILS) or is_admin(uid) or uid in BANNED:
++        return
++    day = (DB.get("daily_stats") or {}).get(_ist_date(), {})
++    k = str(uid)
++    reqs = (day.get("req_users") or {}).get(k, 0)
++    fails = (day.get("fail_users") or {}).get(k, 0)
++    hit = (ABUSE_REQS and reqs >= ABUSE_REQS) or (ABUSE_FAILS and fails >= ABUSE_FAILS)
++    key = (_ist_date(), uid)
++    if not hit or key in _ABUSE_ALERTED:
++        return
++    if len(_ABUSE_ALERTED) > 2000:
++        _ABUSE_ALERTED.clear()
++    _ABUSE_ALERTED.add(key)
++    text = (f"⚠️ <b>Suspicious user</b>\n\n👤 {_utag(uid)}\n🆔 <code>{uid}</code>\n"
++            f"📨 Requests today: <b>{reqs}</b>\n❌ Failures today: <b>{fails}</b>")
++    kb = InlineKeyboardMarkup([[make_button("🚫 Ban", f"adm|u|ban|{uid}", style=BTN_DANGER),
++                                make_button("👤 User", f"adm|u|show|{uid}", style=BTN_PRIMARY)]])
++    try:
++        asyncio.ensure_future(_tell_admins(text, kb), loop=loop)
++    except Exception as e:
++        logger.warning(f"abuse alert failed: {e}")
++
++
++async def spike_worker(client):
++    """Every minute: if the failure rate in the last SPIKE_WINDOW_MIN minutes is too high, DM the admins once."""
++    while True:
++        try:
++            await asyncio.sleep(60)
++            now = time.time()
++            ev = [e for e in list(_EVENTS) if e[0] >= now - SPIKE_WINDOW_MIN * 60]
++            fails = [e for e in ev if not e[1]]
++            if (len(ev) >= SPIKE_MIN_EVENTS and fails and len(fails) / len(ev) >= SPIKE_RATE
++                    and now - _LAST_SPIKE[0] >= SPIKE_COOLDOWN_MIN * 60):
++                _LAST_SPIKE[0] = now
++                cnt = {}
++                for e in fails:
++                    cnt[e[2]] = cnt.get(e[2], 0) + 1
++                top = sorted(cnt.items(), key=lambda x: x[1], reverse=True)[:3]
++                lines = "\n".join(f"• {FAIL_LABELS.get(k, k)}: <b>{c}</b>" for k, c in top)
++                hint = SPIKE_HINTS.get(top[0][0])
++                await _tell_admins(
++                    f"🚨 <b>Failure spike</b>\n\nLast {SPIKE_WINDOW_MIN} min: <b>{len(fails)}/{len(ev)}</b> downloads failed "
++                    f"({len(fails) / len(ev) * 100:.0f}%)\n\n{lines}" + (f"\n\n💡 {hint}" if hint else ""))
++        except asyncio.CancelledError:
++            raise
++        except Exception as e:
++            logger.warning(f"spike worker error: {e}")
++
++
++def parse_duration(tok: str):
++    """'30m' / '12h' / '7d' / '2w' -> seconds (max 365 days); None if not a duration."""
++    m = re.fullmatch(r"(\d+)\s*([mhdw])", (tok or "").strip().lower())
++    if not m:
++        return None
++    secs = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
++    return secs if 60 <= secs <= 365 * 86400 else None
++
++
++def _left_text(td) -> str:
++    s_ = max(int(td.total_seconds()), 0)
++    d, r = divmod(s_, 86400)
++    h, r = divmod(r, 3600)
++    return f"{d}d {h}h" if d else (f"{h}h {r // 60}m" if h else f"{r // 60}m")
++
++
++async def tempban_worker(client):
++    """Every 30 s: lift temporary bans that have run out (and tell the user)."""
++    while True:
++        try:
++            tb = DB.setdefault("tempbans", {})
++            now = _now_utc()
++            for k, iso in list(tb.items()):
++                until = _parse_dt(iso)
++                if until and until > now:
++                    continue
++                tid = int(k)
++                tb.pop(k, None)
++                if tid in BANNED:
++                    BANNED.remove(tid)
++                _BAN_NOTICE_TS.pop(tid, None)
++                (DB.get("ban_info") or {}).pop(k, None)
++                save_data()
++                log_event(f"⏳ <b>Temp-ban ended</b>\n\n👤 {_utag(tid)}")
++                try:
++                    await client.send_message(tid, SC("✅ Aapka temporary ban khatam ho gaya — ab bot use kar sakte ho."))
++                except Exception as e:
++                    logger.info(f"temp-ban end notice to {tid} failed: {e}")
++        except asyncio.CancelledError:
++            raise
++        except Exception as e:
++            logger.warning(f"tempban worker error: {e}")
++        await asyncio.sleep(30)
++
++
++FAIL_LABELS = {
++    "rate_limit": "⏳ YouTube 429 / rate-limit",
++    "bot_check": "🤖 Bot-check (sign in)",
++    "private": "🔒 Private video",
++    "age": "🔞 Age-restricted",
++    "unavailable": "🚫 Unavailable / removed",
++    "live": "📡 Live stream",
++    "too_big": "📦 File too big",
++    "forbidden": "🧱 HTTP 403 / format blocked",
++    "timeout": "⌛ Timeout / stalled",
++    "network": "🌐 Network error",
++    "ffmpeg": "🎞 ffmpeg / merge error",
++    "upload": "📤 Telegram upload error",
++    "other": "❓ Other",
++}
++
++
++def classify_failure(err) -> str:
++    """Short reason key for a download error (same order of checks as friendly_error)."""
++    err = str(err or "")
++    low = err.lower()
++    try:
++        if yt_auth.is_rate_limit_error(err) or "rate-limit" in low or "429" in low:
++            return "rate_limit"
++    except Exception:
++        pass
++    if "sign in to confirm" in low or "not a bot" in low:
++        return "bot_check"
++    if "private video" in low:
++        return "private"
++    if "age" in low and "restrict" in low:
++        return "age"
++    if "unavailable" in low or "removed" in low:
++        return "unavailable"
++    if "live" in low and "not supported" in low:
++        return "live"
++    if "too big" in low or "file too large" in low:
++        return "too_big"
++    if "403" in low or "forbidden" in low or "requested format" in low:
++        return "forbidden"
++    if "timed out" in low or "timeout" in low or "stall" in low:
++        return "timeout"
++    if "ffmpeg" in low or "postprocess" in low or "merge" in low:
++        return "ffmpeg"
++    if "upload" in low or "file_parts" in low or "flood" in low:
++        return "upload"
++    if any(k in low for k in ("connection", "network", "urlopen", "ssl", "name resolution", "unreachable")):
++        return "network"
++    return "other"
++
++
++def _days_back(n: int) -> list:
++    now = datetime.now(_IST)
++    return [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
++
++
++def _bar(v, mx, w=10) -> str:
++    if mx <= 0 or v <= 0:
++        return "░" * w
++    f = max(1, round(v / mx * w))
++    return "█" * f + "░" * (w - f)
++
++
++def _ulabel(uid) -> str:
++    u = DB["users"].get(str(uid)) or {}
++    name = ("@" + u["username"]) if u.get("username") else (u.get("full_name") or str(uid))
++    return esc(name[:20]) + (" 🚫" if int(uid) in BANNED else "")
++
++
++def _range_label(rng: str) -> str:
++    return {"1": "Today", "7": "7 days", "14": "14 days", "all": "All-time"}.get(rng, rng)
++
++
++def _cache_rate(data) -> str:
++    h = sum(x.get("cache_hits", 0) for _, x in data)
++    mi = sum(x.get("cache_miss", 0) for _, x in data)
++    return f"{h / (h + mi) * 100:.0f}%" if (h + mi) else "—"
++
++
++def dashboard_content(view: str = "ov", rng: str = "7"):
++    """Admin dashboard. view: ov (daily downloads) | top (top users) | fail (failure reasons) | ban (banned users)."""
++    ds = DB.get("daily_stats") or {}
++    mb = make_button
++    rows, text = [], ""
++
++    if view == "ov":
++        days = _days_back(7)
++        data = [(d, ds.get(d, {})) for d in days]
++        mx = max([x.get("downloads", 0) for _, x in data] + [1])
++        lines = []
++        for d, x in data:
++            dl, fl = x.get("downloads", 0), x.get("failures", 0)
++            lines.append(f"{datetime.strptime(d, '%Y-%m-%d').strftime('%d %b')} {_bar(dl, mx)} {dl:>4}  ❌{fl}")
++        tdl = sum(x.get("downloads", 0) for _, x in data)
++        tfl = sum(x.get("failures", 0) for _, x in data)
++        tnew = sum(x.get("new_users", 0) for _, x in data)
++        rate = f"{tdl / (tdl + tfl) * 100:.0f}%" if (tdl + tfl) else "—"
++        users, total_dl, active, uptime = get_stats()
++        text = (
++            "📊 <b>Dashboard — Daily downloads</b> <i>(last 7 days, IST)</i>\n\n"
++            "<pre>" + "\n".join(lines) + "</pre>\n"
++            f"📥 <b>{tdl:,}</b> downloads · ❌ <b>{tfl:,}</b> failed · ✅ success <b>{rate}</b>\n"
++            f"👥 New users: <b>{tnew:,}</b> · ⚡ Cache hit: <b>{_cache_rate(data)}</b>\n\n"
++            f"🌍 Totals: {users:,} users · {total_dl:,} downloads · {active} active today · ⏱ {uptime}"
++        )
++        rng_row = None
++
++    elif view == "top":
++        if rng not in ("1", "7", "all"):
++            rng = "7"
++        if rng == "all":
++            pairs = [(int(uid), u.get("total_downloads", 0)) for uid, u in DB["users"].items()]
++        else:
++            agg = {}
++            for d in _days_back(int(rng)):
++                for uid, n in (ds.get(d, {}).get("dl_users") or {}).items():
++                    agg[uid] = agg.get(uid, 0) + n
++            pairs = [(int(uid), n) for uid, n in agg.items()]
++        pairs = sorted([x for x in pairs if x[1] > 0], key=lambda x: x[1], reverse=True)[:10]
++        mx = pairs[0][1] if pairs else 1
++        if pairs:
++            body = "\n".join(f"{i}. {_ulabel(uid)} — <b>{n:,}</b> {_bar(n, mx, 6)}\n    <code>{uid}</code>"
++                             for i, (uid, n) in enumerate(pairs, 1))
++        else:
++            body = "Abhi data nahi hai."
++        text = f"🏆 <b>Dashboard — Top users</b> <i>({_range_label(rng)})</i>\n\n{body}"
++        if rng != "all":
++            text += "\n\n<i>Per-user daily data update ke baad se count hota hai.</i>"
++        text += "\n\n<i>User kholne ke liye neeche tap karo (wahan Ban/Unban button hai).</i>"
++        for uid, n in pairs[:6]:
++            rows.append([mb(f"👤 {re.sub(r'<[^>]+>', '', _ulabel(uid))} · {n:,}", f"adm|u|show|{uid}", style=BTN_PRIMARY)])
++        rng_row = [("1", "Today"), ("7", "7d"), ("all", "All-time")]
++
++    elif view == "fail":
++        if rng not in ("1", "7", "14"):
++            rng = "7"
++        agg, total_fail = {}, 0
++        for d in _days_back(int(rng)):
++            x = ds.get(d, {})
++            total_fail += x.get("failures", 0)
++            for k, n in (x.get("fail_reasons") or {}).items():
++                agg[k] = agg.get(k, 0) + n
++        tracked = sum(agg.values())
++        if total_fail > tracked:  # failures counted before reason tracking existed
++            agg["untracked"] = total_fail - tracked
++        items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
++        tot = sum(n for _, n in items)
++        mx = items[0][1] if items else 1
++        if items:
++            body = "\n".join(
++                f"{FAIL_LABELS.get(k, '🕘 Before tracking' if k == 'untracked' else k)}\n"
++                f"    {_bar(n, mx, 8)} <b>{n}</b> ({n / tot * 100:.0f}%)"
++                for k, n in items)
++        else:
++            body = "🎉 Koi failure nahi."
++        text = f"❌ <b>Dashboard — Failure reasons</b> <i>({_range_label(rng)})</i>\n\nTotal: <b>{tot}</b>\n\n{body}"
++        rng_row = [("1", "Today"), ("7", "7d"), ("14", "14d")]
++
++    elif view == "sus":
++        if rng not in ("1", "3"):
++            rng = "1"
++        if not (ABUSE_REQS or ABUSE_FAILS):
++            text = "⚠️ <b>Dashboard — Suspicious users</b>\n\nAbuse detection off hai (<code>ABUSE_REQS</code> / <code>ABUSE_FAILS</code> = 0)."
++        else:
++            tot_r, tot_f, flagged = {}, {}, set()
++            for d in _days_back(int(rng)):
++                x = ds.get(d, {})
++                rq, fl = x.get("req_users") or {}, x.get("fail_users") or {}
++                for k in set(rq) | set(fl):
++                    tot_r[k] = tot_r.get(k, 0) + rq.get(k, 0)
++                    tot_f[k] = tot_f.get(k, 0) + fl.get(k, 0)
++                    if (ABUSE_REQS and rq.get(k, 0) >= ABUSE_REQS) or (ABUSE_FAILS and fl.get(k, 0) >= ABUSE_FAILS):
++                        flagged.add(k)
++            cand = [k for k in flagged if not is_admin(int(k))]
++            already = sum(1 for k in cand if int(k) in BANNED)
++            cand = sorted([k for k in cand if int(k) not in BANNED], key=lambda k: tot_f.get(k, 0) * 5 + tot_r.get(k, 0), reverse=True)[:8]
++            body = "\n".join(f"• {_ulabel(k)} — 📨 <b>{tot_r.get(k, 0)}</b> · ❌ <b>{tot_f.get(k, 0)}</b>\n    <code>{k}</code>" for k in cand) \
++                or "✅ Koi suspicious user nahi."
++            text = (f"⚠️ <b>Dashboard — Suspicious users</b> <i>({'Today' if rng == '1' else '3 days'})</i>\n\n{body}\n\n"
++                    f"<i>Limit (per din): {ABUSE_REQS or '—'} requests ya {ABUSE_FAILS or '—'} failures.</i>"
++                    + (f"\n<i>{already} flagged user pehle se banned hai.</i>" if already else ""))
++            for i in range(0, len(cand), 2):
++                rows.append([mb(f"🚫 Ban {re.sub(r'<[^>]+>', '', _ulabel(k))[:14]}", f"adm|u|ban|{k}", style=BTN_DANGER) for k in cand[i:i + 2]])
++        rng_row = [("1", "Today"), ("3", "3 days")]
++
++    elif view == "vid":
++        tv = DB.get("top_videos") or {}
++        top = sorted(tv.items(), key=lambda x: x[1].get("n", 0), reverse=True)[:8]
++        hits = misses = served = 0
++        for d in _days_back(7):
++            x = ds.get(d, {})
++            hits += x.get("cache_hits", 0)
++            misses += x.get("cache_miss", 0)
++            served += x.get("cache_bytes", 0)
++        tot = hits + misses
++        rate = f"{hits / tot * 100:.0f}%" if tot else "—"
++        body = "\n".join(
++            f"{i}. <a href=\"https://youtu.be/{vid}\">{esc((e.get('t') or vid)[:45])}</a> — <b>{e.get('n', 0)}</b>"
++            for i, (vid, e) in enumerate(top, 1)) or "Abhi data nahi hai."
++        tip = ""
++        if FILE_CACHE_MAX and len(FILE_CACHE) >= FILE_CACHE_MAX * 0.9:
++            tip = "\n\n💡 Cache lagbhag full hai — <code>FILE_CACHE_MAX</code> badhao."
++        elif tot >= 20 and hits / tot < 0.2:
++            tip = "\n\n💡 Hit rate kam hai (&lt;20%) — cache abhi zyada kaam nahi aa raha."
++        text = (f"🎬 <b>Dashboard — Top videos &amp; cache</b>\n\n<b>Most downloaded</b> <i>(all-time)</i>\n{body}\n\n"
++                f"⚡ <b>Cache (7 days)</b>\n• Hit rate: <b>{rate}</b> ({hits:,} hit / {misses:,} miss)\n"
++                f"• Served from cache: <b>{human_size(served)}</b>\n• Cached files: <b>{len(FILE_CACHE):,}</b> / {FILE_CACHE_MAX:,}" + tip)
++        rng_row = None
++
++    elif view == "prem":
++        now_ = _now_utc()
++        win = PREMIUM_REMINDER_HOURS or 48
++        timed = life = 0
++        exp = []
++        for uid_, _u in DB["users"].items():
++            iu = int(uid_)
++            if is_admin(iu):
++                continue
++            st = get_premium_status(iu)
++            if not st["is_premium"]:
++                continue
++            if st["lifetime"]:
++                life += 1
++            else:
++                timed += 1
++                left = st["expires_at"] - now_
++                if left <= timedelta(hours=win):
++                    exp.append((left, iu))
++        exp.sort(key=lambda x: x[0])
++        lim = sorted(((k, n) for k, n in (ds.get(_ist_date(), {}).get("limit_users") or {}).items()
++                      if not get_premium_status(int(k))["is_premium"]), key=lambda x: x[1], reverse=True)
++        added7 = sales7 = sales_n7 = 0
++        for d in _days_back(7):
++            x = ds.get(d, {})
++            added7 += x.get("premium_added", 0)
++            sales7 += x.get("sales", 0)
++            sales_n7 += x.get("sales_n", 0)
++        exp_txt = "\n".join(f"• {_ulabel(u_)} — {_left_text(l_)} left" for l_, u_ in exp[:8]) or "Koi nahi."
++        lim_txt = "\n".join(f"• {_ulabel(k)} — {n}x" for k, n in lim[:6]) or "Aaj kisi ne limit hit nahi ki."
++        text = (f"💎 <b>Dashboard — Premium</b>\n\n"
++                f"• Active (timed): <b>{timed}</b> · Lifetime: <b>{life}</b>\n"
++                f"• Activated (7d): <b>{added7}</b>\n"
++                f"• 💰 Sales (7d, est.): <b>₹{sales7:,}</b> from {sales_n7} <code>/addpremium</code> plan grants\n\n"
++                f"⏰ <b>Expiring in {win}h</b> ({len(exp)})\n{exp_txt}\n\n"
++                f"🎯 <b>Free users who hit the daily limit today</b> ({len(lim)})\n{lim_txt}\n\n"
++                "<i>Sales = sirf wo grants jo /addpremium se kisi plan ke days se match karein.</i>")
++        for _l, u_ in exp[:3]:
++            rows.append([mb(f"💎 Renew {re.sub(r'<[^>]+>', '', _ulabel(u_))[:16]}", f"adm|u|show|{u_}", style=BTN_PRIMARY)])
++        for k, _n in lim[:3]:
++            rows.append([mb(f"🎯 {re.sub(r'<[^>]+>', '', _ulabel(k))[:18]}", f"adm|u|show|{k}", style=BTN_PRIMARY)])
++        rng_row = None
++
++    else:  # ban
++        view, rng_row = "ban", None
++        info = DB.get("ban_info") or {}
++        if BANNED:
++            lines = []
++            for tid in BANNED[-15:][::-1]:
++                r = (info.get(str(tid)) or {}).get("reason")
++                until = _parse_dt((DB.get("tempbans") or {}).get(str(tid)))
++                lines.append(f"• {_ulabel(tid)} <code>{tid}</code>"
++                             + (f" ⏳ {_left_text(until - _now_utc())} left" if until else "")
++                             + (f"\n    📝 {esc(r[:80])}" if r else ""))
++            body = "\n".join(lines)
++            for tid in BANNED[-8:][::-1]:
++                rows.append([mb(f"✅ Unban {re.sub(r'<[^>]+>', '', _ulabel(tid))}", f"adm|u|unban|{tid}", style=BTN_PRIMARY)])
++        else:
++            body = "✅ Koi banned user nahi hai."
++        text = (f"🚫 <b>Dashboard — Banned users ({len(BANNED)})</b>\n\n{body}\n\n"
++                "<i>Commands:</i> <code>/ban &lt;id|@user&gt; [reason]</code> · <code>/tempban &lt;id|@user&gt; 24h [reason]</code> · <code>/unban &lt;id|@user&gt;</code>")
++
++    if rng_row:
++        rows.append([mb(("• " if k == rng else "") + lbl, f"adm|dash|{view}|{k}", style=BTN_PRIMARY) for k, lbl in rng_row])
++    nav = [("ov", "📈 Overview"), ("top", "🏆 Top users"), ("fail", "❌ Failures"),
++           ("sus", "⚠️ Suspicious"), ("vid", "🎬 Videos"), ("prem", "💎 Premium")]
++    for i in (0, 3):
++        rows.append([mb(lbl, f"adm|dash|{k}|{'1' if k == 'sus' else '7'}", style=BTN_PRIMARY) for k, lbl in nav[i:i + 3]])
++    rows.append([mb("🚫 Banned", "adm|dash|ban|7", style=BTN_PRIMARY),
++                 mb("🔄 Refresh", f"adm|dash|{view}|{rng}", style=BTN_PRIMARY),
++                 mb("🔙 Panel", "adm|panel", style=BTN_PRIMARY)])
++    return text, InlineKeyboardMarkup(rows)
++
++
+ async def daily_report_worker(client):
+     """Once a day (DAILY_REPORT_TIME, IST) posts the report to the log channel (else DMs the admins)."""
+     target = _parse_hhmm(DAILY_REPORT_TIME)
+@@ -1257,7 +1710,10 @@
+ 𝘾𝙝𝙚𝙘𝙠 𝙮𝙤𝙪𝙧 𝙘𝙪𝙧𝙧𝙚𝙣𝙩 𝙥𝙡𝙖𝙣.
+ 
+ 🎁 "/referral"
+-𝙄𝙣𝙫𝙞𝙩𝙚 𝙛𝙧𝙞𝙚𝙣𝙙𝙨 𝙖𝙣𝙙 𝙚𝙖𝙧𝙣 𝙛𝙧𝙚𝙚 𝙥𝙧𝙚𝙢𝙞𝙪𝙢.</blockquote>
++𝙄𝙣𝙫𝙞𝙩𝙚 𝙛𝙧𝙞𝙚𝙣𝙙𝙨 𝙖𝙣𝙙 𝙚𝙖𝙧𝙣 𝙛𝙧𝙚𝙚 𝙥𝙧𝙚𝙢𝙞𝙪𝙢.
++
++🌐 "/language"
++𝘾𝙝𝙖𝙣𝙜𝙚 𝙮𝙤𝙪𝙧 𝙡𝙖𝙣𝙜𝙪𝙖𝙜𝙚.</blockquote>
+ ━━━━━━━━━━━━━━━━━━
+ <blockquote>⚠️ 𝙃𝘼𝙑𝙄𝙉𝙂 𝙏𝙍𝙊𝙐𝘽𝙇𝙀?
+ 
+@@ -2913,6 +3369,7 @@
+         [mb("🔄 Reset Verifications", "adm|reset", style=BTN_PRIMARY), mb("📊 Export Users", "adm|export", style=BTN_PRIMARY)],
+         [mb("🔍 Find User", "adm|usearch", style=BTN_PRIMARY), mb("📈 Today's Report", "adm|report", style=BTN_PRIMARY)],
+         [mb("📝 Maint. Message", "adm|mtext", style=BTN_PRIMARY), mb("🍪 YouTube Auth", "adm|auth", style=BTN_PRIMARY)],
++        [mb("📊 Dashboard", "adm|dash|ov|7", style=BTN_PRIMARY), mb("🚫 Banned Users", "adm|dash|ban|7", style=BTN_PRIMARY)],
+         [mb("❌ Close", "adm|close", style=BTN_DANGER)],
+     ])
+     return text, kb
+@@ -3084,6 +3541,12 @@
+             _back_kb("🔙 Cancel"),
+         )
+ 
++    elif act == "dash":
++        view = parts[2] if len(parts) > 2 else "ov"
++        rng = parts[3] if len(parts) > 3 else "7"
++        text, kb = dashboard_content(view, rng)
++        await safe_edit(msg, text[:4000], kb)
++
+     elif act == "u":
+         sub, tid = parts[2], int(parts[3])
+         if str(tid) not in DB["users"]:
+@@ -3104,6 +3567,8 @@
+             if tid in BANNED:
+                 BANNED.remove(tid)
+                 _BAN_NOTICE_TS.pop(tid, None)
++                (DB.get("ban_info") or {}).pop(str(tid), None)
++                (DB.get("tempbans") or {}).pop(str(tid), None)
+                 save_data()
+                 try:
+                     await client.send_message(tid, SC("✅ Aapko unban kar diya gaya hai — ab bot use kar sakte ho."))
+@@ -3564,6 +4029,7 @@
+     if not await cooldown_ok(m):
+         return
+     uid = m.from_user.id
++    record_request(uid)
+ 
+     pl_url = extract_playlist_url(m.text)
+     if pl_url:  # pure playlist link
+@@ -4178,6 +4644,7 @@
+         return False
+     schedule_delete(sent.chat.id, sent.id)
+     increment_downloads(uid)
++    record_download(uid, url, ent.get("title"), ent.get("size"), True)
+     if not get_premium_status(uid)["is_premium"]:
+         bump_daily_count(uid)
+     log_event(f"⚡ <b>Cache Hit</b>\n\n👤 {_utag(uid)}\n🎬 {esc(ent['title'])}\n"
+@@ -4394,6 +4861,7 @@
+             except OSError:
+                 pass
+         increment_downloads(uid)
++        record_download(uid, url, title, size, False)
+         if not get_premium_status(uid)["is_premium"]:
+             bump_daily_count(uid)
+         log_event(
+@@ -4419,7 +4887,7 @@
+         await safe_edit(status, T(uid, "dl_cancelled", SC("🛑 <b>Download cancelled.</b>")))
+     except TooBig as e:
+         await safe_edit(status, SC("❌ <b>File too big</b>\n\n") + esc(str(e)))
+-        bump_stat("failures")
++        record_failure(uid, "too_big")
+         log_event(f"❌ <b>File Too Big</b>\n\n👤 {_utag(uid)}\n🔗 {esc(req['url'])}\n{esc(str(e)[:300])}")
+     except YouTubeCooldown as e:
+         await safe_edit(status, SC("🛑 <b>YouTube cooldown</b>\n\n") + esc(str(e)))
+@@ -4428,7 +4896,7 @@
+             await safe_edit(status, T(uid, "dl_cancelled", SC("🛑 <b>Download cancelled.</b>")))
+         else:
+             logger.exception("job failed")
+-            bump_stat("failures")
++            record_failure(uid, classify_failure(str(e)))
+             log_event(f"❌ <b>Download Failed</b>\n\n👤 {_utag(uid)}\n🔗 {esc(req['url'])}\n<code>{esc(str(e)[:400])}</code>")
+             await safe_edit(
+                 status,
+@@ -4487,6 +4955,7 @@
+                 break
+             except TooBig as ex:
+                 failed.append((e["title"], "file too big"))
++                record_failure(uid, "too_big")
+             except YouTubeCooldown:
+                 cooldown_hit = True
+                 break
+@@ -4496,6 +4965,7 @@
+                     break
+                 logger.warning(f"playlist item {e['id']} failed: {ex}")
+                 failed.append((e["title"], friendly_error(str(ex))[:80]))
++                record_failure(uid, classify_failure(str(ex)))
+                 if yt_auth.cooldown_remaining() > 0:  # this item just hit a 429 -> stop, don't hammer
+                     cooldown_hit = True
+                     break
+@@ -4582,6 +5052,7 @@
+     if used + in_flight < DAILY_FREE_LIMIT:
+         return False
+     if used >= DAILY_FREE_LIMIT:
++        bump_stat_map("limit_users", str(user_id))
+         await send_referral_prompt(client, user_id)
+     return True
+ 
+@@ -4924,6 +5395,10 @@
+     else:
+         parallel = parallel_for_days(days)
+     set_premium(target, days, parallel)
++    price = next((pr for pr, d in PLANS if d == days), None)  # plan-matched grant = a sale (estimate)
++    if price:
++        bump_stat("sales", price)
++        bump_stat("sales_n")
+     await m.reply(SC(f"✅ Premium granted to <code>{target}</code> — {note}.\nPlan: {plan_summary(target)}"))
+     try:
+         await client.send_message(target, SC(f"🎉 You've been given Premium ({note}) by the admin!\n⚡ Ek saath {fmt_parallel(max_parallel_jobs(target))} downloads chala sakte ho."))
+@@ -5019,6 +5494,39 @@
+     raise StopPropagation
+ 
+ 
++def _needs_language(_, __, upd) -> bool:
++    """True for a normal user who has not picked a language yet (admins, banned and maintenance users
++    are handled elsewhere)."""
++    u = getattr(upd, "from_user", None)
++    if not u or u.is_bot or is_admin(u.id) or u.id in BANNED or DB.get("maintenance_mode"):
++        return False
++    return not user_lang(u.id)
++
++
++nolang_filter = filters.create(_needs_language)
++
++
++@app.on_message(filters.private & nolang_filter & ~filters.command(["start", "language"]), group=-1)
++async def nolang_message_block(client: Client, m: Message):
++    """No language picked yet: every command / button / link shows the force-join screen (if not joined)
++    or the language picker, and nothing else runs until a language is chosen."""
++    if await gate_message(client, m):
++        await send_language_picker(client, m.chat.id)
++    raise StopPropagation
++
++
++@app.on_callback_query(nolang_filter & ~filters.regex(r"^(lg\|[a-z]{2,3}|lgx|vsub)$"), group=-1)
++async def nolang_callback_block(client: Client, query):
++    if await gate_query(client, query):
++        try:
++            await query.answer("🌐 Pehle language chuno / Choose your language first")
++        except Exception:
++            pass
++        if query.message:
++            await send_language_picker(client, query.message.chat.id)
++    raise StopPropagation
++
++
+ def _target_id(m: Message):
+     """User id from `/cmd <id>` or from replying to a forwarded/user message."""
+     if len(m.command) >= 2:
+@@ -5032,35 +5540,100 @@
+     return None
+ 
+ 
++def _target_and_reason(m: Message):
++    """(user_id, reason) from `/cmd <id|@username> [reason]` or from replying to a user's message."""
++    args = m.command[1:]
++    if args:
++        tok = args[0]
++        tid = int(tok) if tok.lstrip("-").isdigit() else _find_user(tok)
++        if tid is not None:
++            return tid, " ".join(args[1:]).strip()
++    r = m.reply_to_message
++    if r and r.from_user and not r.from_user.is_bot:
++        return r.from_user.id, " ".join(args).strip()
++    return None, ""
++
++
++@app.on_message(filters.command("dashboard") & filters.private & admin_only_early)
++async def dashboard_cmd(client: Client, m: Message):
++    text, kb = dashboard_content("ov", "7")
++    await m.reply(text, reply_markup=kb)
++
++
+ @app.on_message(filters.command("ban") & filters.private & admin_only_early)
+ async def ban_cmd(client: Client, m: Message):
+-    tid = _target_id(m)
++    tid, reason = _target_and_reason(m)
+     if tid is None:
+-        return await m.reply(SC("⚠️ <b>Usage:</b> <code>/ban &lt;user_id&gt;</code>"))
++        return await m.reply(SC("⚠️ <b>Usage:</b> <code>/ban &lt;user_id|@username&gt; [reason]</code>"))
+     if is_admin(tid):
+         return await m.reply(SC("⚠️ Admin ko ban nahi kar sakte."))
+     if tid in BANNED:
+         return await m.reply(SC(f"⚠️ <code>{tid}</code> pehle se banned hai."))
+     BANNED.append(tid)
++    (DB.get("tempbans") or {}).pop(str(tid), None)  # a permanent ban replaces a temp one
++    DB.setdefault("ban_info", {})[str(tid)] = {
++        "reason": reason[:200], "at": datetime.now().isoformat(), "by": m.from_user.id}
+     save_data()
+-    await m.reply(SC(f"🚫 <code>{tid}</code> ban ho gaya."))
++    await m.reply(SC(f"🚫 <code>{tid}</code> ban ho gaya.") + (f"\n📝 {esc(reason[:200])}" if reason else ""))
++    log_event(f"🚫 <b>User banned</b>\n\n👤 {_utag(tid)}" + (f"\n📝 {esc(reason[:200])}" if reason else ""))
+     try:
+-        await client.send_message(tid, SC("🚫 Aapko is bot se ban kar diya gaya hai."))
++        await client.send_message(tid, SC("🚫 Aapko is bot se ban kar diya gaya hai.")
++                                  + (f"\n📝 {esc(reason[:200])}" if reason else ""))
+     except Exception as e:
+         logger.info(f"ban notice to {tid} failed: {e}")
+ 
+ 
++@app.on_message(filters.command("tempban") & filters.private & admin_only_early)
++async def tempban_cmd(client: Client, m: Message):
++    usage = SC("⚠️ <b>Usage:</b> <code>/tempban &lt;user_id|@username&gt; &lt;30m|12h|7d&gt; [reason]</code>\n"
++               "Ya kisi user ke message par reply karke: <code>/tempban 24h [reason]</code>")
++    args = m.command[1:]
++    r = m.reply_to_message
++    tid = secs = None
++    if args and parse_duration(args[0]) and r and r.from_user and not r.from_user.is_bot:
++        tid, secs, reason = r.from_user.id, parse_duration(args[0]), " ".join(args[1:]).strip()
++    elif len(args) >= 2:
++        tok = args[0]
++        tid = int(tok) if tok.lstrip("-").isdigit() else _find_user(tok)
++        secs, reason = parse_duration(args[1]), " ".join(args[2:]).strip()
++    if tid is None or not secs:
++        return await m.reply(usage)
++    if is_admin(tid):
++        return await m.reply(SC("⚠️ Admin ko ban nahi kar sakte."))
++    tb = DB.setdefault("tempbans", {})
++    if tid in BANNED and str(tid) not in tb:
++        return await m.reply(SC(f"⚠️ <code>{tid}</code> pehle se permanent banned hai (/unban karke dobara try karo)."))
++    until = _now_utc() + timedelta(seconds=secs)
++    if tid not in BANNED:
++        BANNED.append(tid)
++    tb[str(tid)] = until.isoformat()
++    DB.setdefault("ban_info", {})[str(tid)] = {
++        "reason": reason[:200], "at": datetime.now().isoformat(), "by": m.from_user.id, "until": until.isoformat()}
++    save_data()
++    left = _left_text(timedelta(seconds=secs))
++    await m.reply(SC(f"⏳ <code>{tid}</code> {left} ke liye ban ho gaya.") + (f"\n📝 {esc(reason[:200])}" if reason else ""))
++    log_event(f"⏳ <b>User temp-banned</b> ({left})\n\n👤 {_utag(tid)}" + (f"\n📝 {esc(reason[:200])}" if reason else ""))
++    try:
++        await client.send_message(tid, SC(f"🚫 Aapko {left} ke liye bot se ban kiya gaya hai.")
++                                  + (f"\n📝 {esc(reason[:200])}" if reason else ""))
++    except Exception as e:
++        logger.info(f"temp-ban notice to {tid} failed: {e}")
++
++
+ @app.on_message(filters.command("unban") & filters.private & admin_only_early)
+ async def unban_cmd(client: Client, m: Message):
+-    tid = _target_id(m)
++    tid, _ = _target_and_reason(m)
+     if tid is None:
+-        return await m.reply(SC("⚠️ <b>Usage:</b> <code>/unban &lt;user_id&gt;</code>"))
++        return await m.reply(SC("⚠️ <b>Usage:</b> <code>/unban &lt;user_id|@username&gt;</code>"))
+     if tid not in BANNED:
+         return await m.reply(SC(f"⚠️ <code>{tid}</code> banned nahi hai."))
+     BANNED.remove(tid)
+     _BAN_NOTICE_TS.pop(tid, None)
++    (DB.get("ban_info") or {}).pop(str(tid), None)
++    (DB.get("tempbans") or {}).pop(str(tid), None)
+     save_data()
+     await m.reply(SC(f"✅ <code>{tid}</code> unban ho gaya."))
++    log_event(f"✅ <b>User unbanned</b>\n\n👤 {_utag(tid)}")
+     try:
+         await client.send_message(tid, SC("✅ Aapko unban kar diya gaya hai — ab bot use kar sakte ho."))
+     except Exception as e:
+@@ -5071,7 +5644,10 @@
+ async def banned_list_cmd(client: Client, m: Message):
+     if not BANNED:
+         return await m.reply(SC("✅ Koi banned user nahi hai."))
+-    lines = "\n".join(f"• <code>{i}</code>" for i in BANNED[:100])
++    info = DB.get("ban_info") or {}
++    lines = "\n".join(
++        f"• <code>{i}</code>" + (f" — {esc((info.get(str(i)) or {}).get('reason', '')[:60])}" if (info.get(str(i)) or {}).get("reason") else "")
++        for i in BANNED[:100])
+     more = f"\n…+{len(BANNED) - 100} more" if len(BANNED) > 100 else ""
+     await m.reply(SC(f"🚫 <b>Banned users ({len(BANNED)})</b>\n\n") + lines + more)
+ 
+@@ -5518,6 +6094,7 @@
+     BotCommand("help", "How to use"),
+     BotCommand("about", "About this bot"),
+     BotCommand("search", "Search YouTube by name"),
++    BotCommand("language", "🌐 Change language"),
+     BotCommand("cancel", "Cancel active download"),
+     BotCommand("stats", "Your statistics"),
+     BotCommand("plans", "💎 View premium plans"),
+@@ -5604,7 +6181,9 @@
+ 
+ ADMIN_COMMANDS = [
+     BotCommand("admin", "👑 Admin panel"),
++    BotCommand("dashboard", "📊 Dashboard: downloads, top users, failures"),
+     BotCommand("ban", "🚫 Ban a user (/ban <id>)"),
++    BotCommand("tempban", "⏳ Temp-ban (/tempban <id> 24h reason)"),
+     BotCommand("unban", "✅ Unban a user (/unban <id>)"),
+     BotCommand("banned", "🚫 List banned users"),
+     BotCommand("broadcast", "📣 Send message to all users"),
+@@ -5655,6 +6234,10 @@
+     if _parse_hhmm(DAILY_REPORT_TIME):
+         asyncio.ensure_future(daily_report_worker(app), loop=loop)
+         logger.info(f"Daily report ON at {DAILY_REPORT_TIME} IST")
++    if SPIKE_RATE > 0:
++        asyncio.ensure_future(spike_worker(app), loop=loop)
++        logger.info(f"Failure-spike alert ON (>= {SPIKE_RATE:.0%} of >= {SPIKE_MIN_EVENTS} downloads in {SPIKE_WINDOW_MIN} min)")
++    asyncio.ensure_future(tempban_worker(app), loop=loop)
+     if PREMIUM_REMINDER_HOURS > 0:
+         asyncio.ensure_future(premium_reminder_worker(app), loop=loop)
+         logger.info(f"Premium renewal reminder ON ({PREMIUM_REMINDER_HOURS}h before expiry)")
