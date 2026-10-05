@@ -32,6 +32,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+import plugin_guard
+plugin_guard.check_and_repair()  # fix corrupted PO-token plugin BEFORE yt_dlp is imported
+
 import autotranslate
 import pot_provider
 import premium_emoji
@@ -2344,6 +2347,7 @@ def fetch_info(url: str):
     import concurrent.futures as cf
     sets = client_sets()
     best, best_clients, last_err, blocked = None, None, None, False
+    multi = None  # (info, clients) of the best set that carries 2+ audio languages
     t0 = time.time()
     ex = cf.ThreadPoolExecutor(max_workers=FETCH_PARALLEL)
     try:
@@ -2368,7 +2372,10 @@ def fetch_info(url: str):
                         break
                     continue
                 h = _max_height(info)
-                logger.info(f"[timing] {time.time() - t0:.1f}s {info.get('id')}: clients={clients} max_height={h}")
+                n_at = len(audio_tracks(info))
+                logger.info(f"[timing] {time.time() - t0:.1f}s {info.get('id')}: clients={clients} max_height={h} audio_langs={n_at}")
+                if n_at >= 2 and (multi is None or h > _max_height(multi[0])):
+                    multi = (info, clients)  # a client set that exposes several audio languages
                 if best is None or h > _max_height(best):
                     best, best_clients = info, clients
                 if h >= GOOD_ENOUGH_HEIGHT:
@@ -2385,11 +2392,49 @@ def fetch_info(url: str):
     logger.info(f"[timing] fetch_info total {time.time() - t0:.1f}s")
     if best is None:
         raise last_err or RuntimeError("Could not fetch video info.")
+    # The tallest set often has ONE audio language only (android_vr / tv / web_safari don't list dubs).
+    # If another set that answered does list several, use it so the audio-track picker can appear —
+    # unless it would cost real resolution.
+    if multi is not None and not audio_tracks(best) and _max_height(multi[0]) >= min(_max_height(best), 720):
+        logger.info(f"[audio] using client set {multi[1]} for its audio languages")
+        best, best_clients = multi
     yt_api.enrich_info(best)  # metadata from the official API (no-op without YT_API_KEY)
     _INFO_CACHE[url] = (time.time(), best, best_clients)
     while len(_INFO_CACHE) > INFO_CACHE_MAX:  # evict oldest first
         _INFO_CACHE.pop(min(_INFO_CACHE, key=lambda k: _INFO_CACHE[k][0]), None)
     return best, best_clients
+
+
+def _audio_formats(info) -> list:
+    return [f for f in info.get("formats") or []
+            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none") and f.get("language")]
+
+
+AUDIO_PROBE = os.getenv("AUDIO_PROBE", "1").strip() not in ("0", "false", "no")
+
+
+@_rotating
+def probe_audio_tracks(url: str):
+    """The client set that won fetch_info often lists ONE audio language only (YouTube exposes dubbed /
+    multi-language tracks to some clients only). Ask a few other clients in parallel and return the first
+    info that really carries 2+ languages, or None."""
+    import concurrent.futures as cf
+    sets = ([["web"]] if pot_provider.is_ready() else []) + [["tv"], ["mweb"]]
+    ex = cf.ThreadPoolExecutor(max_workers=len(sets))
+    try:
+        futs = [ex.submit(contextvars.copy_context().run, _fetch_one, url, cs) for cs in sets]
+        try:
+            for fut in cf.as_completed(futs, timeout=45):
+                info, err = fut.result()
+                n = len(audio_tracks(info)) if info else 0
+                logger.info(f"[audio] probe {url}: {n} language(s)" + (f" err={err[:100]}" if err else ""))
+                if n >= 2:
+                    return info
+        except cf.TimeoutError:
+            pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return None
 
 
 def fetch_playlist(url: str) -> dict:
@@ -2706,10 +2751,12 @@ def _download_with_retry(opts: dict, url: str):
             raise RuntimeError(full) from e
 
 
-@_rotating
-def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, trim=None, alang=None):
+def _download_impl(url, mode, value, vertical, workdir, hook, clients=None, trim=None, alang=None):
     """mode: 'v' (value = height) or 'a' (value = mp3 bitrate)."""
     check_cooldown()
+    # Trim goes through ffmpeg (FFmpegFD), which can't use yt-dlp's 10 MB http chunking and needs a
+    # roomier network timeout than the 8s normal downloads use (it seeks into the middle of the stream).
+    NET = {"socket_timeout": max(DL_SOCKET_TIMEOUT, 30)} if trim else DL_NET_OPTS
     _t0 = time.time()
     _seen = {"first": False}
 
@@ -2726,8 +2773,8 @@ def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, t
         "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
         "progress_hooks": [_timed_hook],
         "writethumbnail": True,
-        "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-        **DL_NET_OPTS,
+        **({} if trim else {"concurrent_fragment_downloads": CONCURRENT_FRAGMENTS}),
+        **NET,
     }
     if trim:  # (start_s, end_s): yt-dlp fetches ONLY that section via ffmpeg, not the whole video
         opts["download_ranges"] = yt_dlp.utils.download_range_func([], [(trim[0], trim[1])])
@@ -2773,7 +2820,7 @@ def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, t
             if cs in tried:
                 continue
             tried.append(cs)
-            o = {**opts, **base_opts(cs), **DL_NET_OPTS, "format": strict_selector(int(value), vertical, alang)}
+            o = {**opts, **base_opts(cs), **NET, "format": strict_selector(int(value), vertical, alang)}
             try:
                 info = _download_with_retry(o, url)
                 break
@@ -2791,7 +2838,7 @@ def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, t
             if cs in tried_fb:
                 continue
             tried_fb.append(cs)
-            o = {**opts, **base_opts(cs), **DL_NET_OPTS, "format": fmt}
+            o = {**opts, **base_opts(cs), **NET, "format": fmt}
             try:
                 info = _download_with_retry(o, url)
                 break
@@ -2819,6 +2866,54 @@ def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, t
         path = max(files, key=os.path.getsize)
     thumb = make_thumb(workdir, vid, path if mode == "v" else None)
     return path, thumb, info
+
+
+def _cut_local(path: str, trim, workdir: str) -> str:
+    """Fallback trim: cut an already-downloaded full file with ffmpeg. Returns the clipped file path."""
+    start, end = trim
+    base, ext = os.path.splitext(path)
+    out = f"{base}_trim{ext}"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", str(start), "-i", path,
+           "-t", str(end - start)]
+    if ext.lower() == ".mp3" or not TRIM_FORCE_KEYFRAMES:
+        cmd += ["-c", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k"]
+    cmd += ["-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+        raise RuntimeError(f"ffmpeg trim failed: {(r.stderr or '')[-300:]}")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out
+
+
+@_rotating
+def download_blocking(url, mode, value, vertical, workdir, hook, clients=None, trim=None, alang=None):
+    """Normal download. With trim: first try yt-dlp's section download (only that clip is fetched);
+    if that fails for any reason except cancel / 429 / sign-in wall, download the full file and cut it
+    locally with ffmpeg, so a trim request still succeeds."""
+    if not trim:
+        return _download_impl(url, mode, value, vertical, workdir, hook, clients, None, alang)
+    try:
+        return _download_impl(url, mode, value, vertical, workdir, hook, clients, trim, alang)
+    except (yt_dlp.utils.DownloadCancelled, YouTubeCooldown):
+        raise
+    except Exception as e:
+        full = str(e)
+        if yt_auth.is_rate_limit_error(full) or yt_auth.is_hard_youtube_block(full):
+            raise
+        logger.warning(f"trim section download failed ({full[:200]}) -> full download + local ffmpeg cut")
+        for f in glob.glob(os.path.join(workdir, "*")):  # drop partial section leftovers
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        path, thumb, info = _download_impl(url, mode, value, vertical, workdir, hook, clients, None, alang)
+        path = _cut_local(path, trim, workdir)
+        return path, thumb, info
 
 
 # ---------------------------------------------------------------------
@@ -4106,6 +4201,26 @@ def quality_rows(token: str, heights) -> list:
     return rows
 
 
+async def _audio_probe_task(token: str, info: dict, url: str):
+    """Background: find the audio languages of a video whose fetched info shows only one."""
+    try:
+        pinfo = await loop.run_in_executor(None, probe_audio_tracks, url)
+    except Exception as e:
+        logger.info(f"[audio] probe failed: {str(e)[:120]}")
+        return
+    req = PENDING.get(token)
+    if not pinfo or req is None:
+        return
+    have = {f.get("format_id") for f in info.get("formats") or []}
+    for f in _audio_formats(pinfo):  # add the language streams to the info the download will reuse
+        if f.get("format_id") not in have:
+            info.setdefault("formats", []).append(f)
+    tracks = audio_tracks(info)
+    if len(tracks) >= 2:
+        req["atracks"] = tracks
+        logger.info(f"[audio] {url}: {len(tracks)} audio languages found by probe")
+
+
 async def show_video_menu(m: Message, uid: int, url: str):
     """Fetch one video's info and show the quality picker (links + search results)."""
     status = await m.reply(T(uid, "fetching", SC("🔍 <b>Fetching video info...</b>")))
@@ -4132,6 +4247,9 @@ async def show_video_menu(m: Message, uid: int, url: str):
         "qopts": [h for h, _ in quality_options(info)],
         "atracks": audio_tracks(info),  # [] = single audio track -> download right after the quality tap
     }
+
+    if AUDIO_PROBE and not PENDING[token]["atracks"]:
+        PENDING[token]["probe"] = asyncio.ensure_future(_audio_probe_task(token, info, url), loop=loop)
 
     rows = quality_rows(token, PENDING[token]["qopts"])
     if PENDING[token]["duration"] > 1:  # ✂️ Video Trim sits right under the video qualities
@@ -4504,6 +4622,12 @@ async def quality_cb(client: Client, query):
 
     # Video has several audio languages -> ask which one AFTER the quality tap.
     # Single-track video -> no extra step, download starts right away.
+    _probe = req.get("probe")
+    if mode == "v" and not req.get("atracks") and _probe is not None and not _probe.done():
+        try:  # the background audio-language check is still running: give it a moment
+            await asyncio.wait_for(asyncio.shield(_probe), 20)
+        except Exception:
+            pass
     tracks = (req.get("atracks") or []) if mode == "v" else []  # MP3 -> never ask, download directly
     if tracks:
         req["pending_q"] = (mode, value)
@@ -4766,7 +4890,7 @@ async def run_one(client, chat_id, uid, url, mode, value, vertical, clients,
                 if now_t - dl_start > DL_HARD_TIMEOUT:
                     prog["abort"] = "timeout"
                     raise RuntimeError(f"Download timed out after {int(now_t - dl_start) // 60} min — skipped.")
-                if prog["started"] and not prog["finished"] and now_t - prog["ts"] > DL_STALL_TIMEOUT:
+                if prog["started"] and not prog["finished"] and now_t - prog["ts"] > (max(DL_STALL_TIMEOUT, 300) if trim else DL_STALL_TIMEOUT):
                     prog["abort"] = "stalled"
                     raise RuntimeError(f"Download stalled ({DL_STALL_TIMEOUT}s no data) — skipped.")
             path, thumb, info = dl_fut.result()
