@@ -170,7 +170,7 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "2") or 0)
 # JSON file for users / force-join channels / banner / maintenance flag
 DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
 # MongoDB (optional). If MONGO_URI is set, all bot data lives in MongoDB; otherwise the JSON file is used.
-MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://Anujedit:Anujedit@cluster0.7cs2nhd.mongodb.net/?appName=Cluster0").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ytbot")
 # Auto-delete sent video/audio from the user's chat after N seconds (0 = off). Cache is NOT affected.
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "3600") or 0)
